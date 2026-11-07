@@ -18,6 +18,48 @@ import pygame
 import torch
 from torch.multiprocessing import Process, Queue, set_start_method
 from general_navigation import carla_test as base
+from general_navigation import depth_occupancy as dpt
+
+
+_stream={'jpg':None}
+
+
+def start_stream(port):
+    """MJPEG live view of the annotated frames (what navigation.mp4 records).
+
+    Open http://localhost:<port>/ (use ssh -L to forward it from the server).
+    """
+    import logging, threading
+    from flask import Flask, Response
+    app=Flask(__name__)
+    logging.getLogger('werkzeug').setLevel(logging.ERROR)
+
+    @app.route('/')
+    def index():
+        return ('<html><head><title>CARLA obstacle test</title></head>'
+                '<body style="background:#222;margin:0;text-align:center">'
+                '<img src="/video_feed" style="width:96vw;image-rendering:pixelated"></body></html>')
+
+    @app.route('/video_feed')
+    def video_feed():
+        def generate():
+            while True:
+                jpg=_stream['jpg']
+                if jpg is None:
+                    blank=np.zeros((128,256,3),np.uint8)
+                    cv2.putText(blank,'Waiting for trial...',(20,64),cv2.FONT_HERSHEY_SIMPLEX,.45,(255,255,255),1)
+                    jpg=cv2.imencode('.jpg',blank)[1].tobytes()
+                yield b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'+jpg+b'\r\n'
+                time.sleep(.05)
+        return Response(generate(),mimetype='multipart/x-mixed-replace; boundary=frame')
+
+    threading.Thread(target=lambda:app.run(host='127.0.0.1',port=port,threaded=True),daemon=True).start()
+    print(f'Live stream: http://localhost:{port}/',flush=True)
+
+
+def publish_frame(image):
+    ok,buf=cv2.imencode('.jpg',image,[int(cv2.IMWRITE_JPEG_QUALITY),90])
+    if ok:_stream['jpg']=buf.tobytes()
 
 
 def pose_json(t):
@@ -103,7 +145,7 @@ def navigation_outcome(distance, goal_radius, motion, now, pose, active,
 
 def trial(client,model,config,device,start,goal,goal_path,label,bp,obstacle_wp,args):
     output=Path(args.output)/label;output.mkdir(exist_ok=False)
-    obstacle=sensor=worker=writer=None
+    obstacle=sensor=worker=writer=depth=None
     states=[];predictions=[];collisions=[];queues=[]
     last_image=None;motion=deque()
     report=dict(trial=label,outcome='error',obstacle=None,states=states,
@@ -128,6 +170,17 @@ def trial(client,model,config,device,start,goal,goal_path,label,bp,obstacle_wp,a
             collisions.append(dict(frame=e.frame,other_type=e.other_actor.type_id,
                 obstacle_collision=obstacle is not None and e.other_actor.id==obstacle.id))
         sensor.listen(collision)
+        # RGB-D: ground-truth depth from a depth camera co-located with the RGB
+        # camera (replaces Depth Anything V2). Logging only; control unchanged.
+        grid=None;grid_cfg=None;depth_img=None;inflate_radius=None
+        if args.depth_camera: #trial 開始時，設定 grid 參數並掛上深度相機
+            grid_cfg=dpt.GridConfig(resolution=args.grid_resolution,h_min=args.grid_h_min,
+                h_max=args.grid_h_max,max_range=args.grid_max_range)
+            depth=dpt.DepthCamera(client)
+            inflate_radius=depth.ego_box[2]+args.safety_margin
+            report['depth_camera']=dict(depth.metadata(grid_cfg),inflate_radius_m=inflate_radius,
+                safety_margin_m=args.safety_margin)
+            if args.save_depth:(output/'depth').mkdir()
         iq,oq=Queue(maxsize=1),Queue(maxsize=1);queues=[iq,oq]
         worker=Process(target=base.async_nomad,args=(iq,oq,model,device,str(goal_path),config));worker.start()
         context=base.FixedImageContext(config['context_size']+1)
@@ -145,6 +198,16 @@ def trial(client,model,config,device,start,goal,goal_path,label,bp,obstacle_wp,a
                 frame_id,timestamp,surface=packet
                 rgb=pygame.surfarray.array3d(surface).transpose(1,0,2)
                 context.add(timestamp,cv2.cvtColor(rgb,cv2.COLOR_RGB2BGR),history[frame_id])
+            if depth is not None: # 取最新的深度圖，投影成 occupancy grid
+                got=depth.latest(history)
+                if got is not None and (grid is None or got[0]!=grid.frame):
+                    depth_frame,depth_img=got
+                    grid=dpt.build_occupancy(depth_img,depth.K,depth.R,depth.t,grid_cfg,
+                        frame=depth_frame,pose=history[depth_frame])
+                    if args.save_depth:
+                        np.savez_compressed(output/'depth'/f'{depth_frame:08d}.npz',
+                            depth_m=depth_img.astype(np.float16),occupied=grid.occupied,
+                            observed=grid.observed,pose=np.asarray(grid.pose))
             request=context.request()
             if not pending and request is not None:
                 images,times,observation_pose=request
@@ -155,6 +218,18 @@ def trial(client,model,config,device,start,goal,goal_path,label,bp,obstacle_wp,a
                 predictions.append(dict(sim_time=snap.timestamp.elapsed_seconds,
                     inference_seconds=seconds,observation_age_wall_s=last_prediction-submitted,
                     candidates=samples,observation_pose=observation_pose))
+                if grid is not None and samples is not None:
+                    # Candidates live in the observation frame; the grid in the
+                    # depth frame's vehicle frame. Go through world coordinates.
+                    inflated=grid.inflated(inflate_radius);checks=[]
+                    for cand in samples: # NoMaD 每次產生候選時：膨脹障礙物，逐條檢查 8 條候選會不會撞 ###########################
+                        local=base.world_to_local(base.local_to_world(cand,observation_pose),grid.pose)
+                        local=dpt.extend_path(local,args.check_horizon)
+                        checks.append(grid.path_clearance(local,inflated))
+                    predictions[-1].update(grid_frame=grid.frame,
+                        candidate_collides=[c[0] for c in checks],
+                        candidate_clearance_m=[None if math.isinf(c[1]) else c[1] for c in checks],
+                        feasible_count=sum(not c[0] for c in checks))
                 if result['speed']>0 and samples is not None:
                     samples_world=np.asarray([base.local_to_world(p,observation_pose) for p in samples])
                     path=base.select_trajectory(samples,observation_pose,path,
@@ -178,7 +253,7 @@ def trial(client,model,config,device,start,goal,goal_path,label,bp,obstacle_wp,a
             if outcome:
                 report['outcome']=outcome
                 if outcome=='fail':
-                    report['failure_reason']='goal_overshoot'
+                    report['failure_reason']='goal_overshoot' # 車子沒有進入目標半徑，卻沿著道路方向開過了目標點
                 if outcome=='stuck':
                     report['stuck_reason']='obstacle_contact' if any(c['obstacle_collision'] for c in collisions) else 'no_motion'
             elif ((args.timeout_sim>0 and snap.timestamp.elapsed_seconds-started>=args.timeout_sim)
@@ -189,11 +264,33 @@ def trial(client,model,config,device,start,goal,goal_path,label,bp,obstacle_wp,a
                 elapsed_sim_s=snap.timestamp.elapsed_seconds-started,pose=list(pose),
                 vehicle_pose_3d=pose_json(client.world.player.get_transform()),
                 goal_distance_m=distance,goal_overshoot_m=overshoot,speed_command=controls.speed,steer=steer))
+            if grid is not None: # 每一步計算車頭前方的淨空距離
+                clearance=grid.front_clearance(depth.ego_box[1],depth.ego_box[2])
+                states[-1].update(depth_frame=grid.frame,
+                    front_clearance_m=None if math.isinf(clearance) else clearance)
             state=base.camera_state(client)
             if state is not None:
                 image=base.draw_nomad_paths(state.image.cv_image(),samples_world,path,pose)
                 cv2.putText(image,f'{label} t={states[-1]["elapsed_sim_s"]:.1f} d={distance:.2f}m',(4,14),cv2.FONT_HERSHEY_SIMPLEX,.32,(0,255,0),1)
                 cv2.putText(image,(outcome or 'navigating').upper(),(4,34),cv2.FONT_HERSHEY_SIMPLEX,.5,(0,255,0) if outcome=='arrived' else (0,200,255),1)
+                if depth is not None: # 影片中的深度圖和 BEV 畫面	
+                    h=image.shape[0]
+                    dimg=(dpt.colorize_depth(depth_img) if depth_img is not None
+                          else np.zeros((h,image.shape[1],3),np.uint8))
+                    dimg=cv2.resize(dimg,(round(dimg.shape[1]*h/dimg.shape[0]),h),interpolation=cv2.INTER_NEAREST)
+                    to_grid=(lambda paths:None if paths is None or grid is None else
+                             [base.world_to_local(p,grid.pose) for p in paths])
+                    sel=to_grid(None if path is None else [path])
+                    feas=(None if not predictions or 'candidate_collides' not in predictions[-1]
+                          else [not c for c in predictions[-1]['candidate_collides']])
+                    cands=to_grid(samples_world)
+                    if cands is not None:cands=[dpt.extend_path(c,args.check_horizon) for c in cands]
+                    bev=dpt.render_bev(grid,(h,h),candidates=cands,
+                        selected=None if sel is None else sel[0],
+                        feasible=feas if cands is not None and feas is not None and len(feas)==len(cands) else None,
+                        ego_box=depth.ego_box,inflate_radius=inflate_radius)
+                    image=np.hstack((image,dimg,bev))
+                if args.stream_port:publish_frame(image)
                 last_image=image.copy()
                 if writer is None:
                     writer=cv2.VideoWriter(str(output/'navigation.mp4'),cv2.VideoWriter_fourcc(*'mp4v'),1/base.CONTROL_DT,(image.shape[1],image.shape[0]))
@@ -220,6 +317,7 @@ def trial(client,model,config,device,start,goal,goal_path,label,bp,obstacle_wp,a
                 cv2.rectangle(last_image,(0,19),(last_image.shape[1],44),(0,0,0),-1)
                 cv2.putText(last_image,report['outcome'].upper(),(4,36),cv2.FONT_HERSHEY_SIMPLEX,.55,(0,255,0) if report['outcome']=='arrived' else (0,200,255),1)
                 cv2.imwrite(str(output/'last.png'),last_image)
+                if args.stream_port:publish_frame(last_image)
                 for _ in range(round(2/base.CONTROL_DT)):
                     writer.write(last_image)
                     report['video_terminal_frames']+=1
@@ -237,6 +335,7 @@ def trial(client,model,config,device,start,goal,goal_path,label,bp,obstacle_wp,a
         if worker:worker.terminate();worker.join(timeout=5)
         if worker and worker.is_alive():worker.kill();worker.join(timeout=5)
         for q in queues:q.close()
+        if depth is not None:depth.destroy()
         for actor in [sensor,obstacle]:
             if actor:
                 try:
@@ -258,6 +357,7 @@ def main(args):
     if any((output/name).exists() for name in ('baseline','small','medium','large','goal.png','manifest.json','error.txt','initialization.json','native_fault.log')):
         output=output/('run_'+datetime.now().strftime('%Y%m%d_%H%M%S_%f'))
     output.mkdir(parents=True,exist_ok=True)
+    args.output=str(output)  # trials must write into the same (possibly new run_*) folder
     print(f'Output directory: {output.resolve()}',flush=True)
     # Keep a native traceback even when a C/C++ extension crashes outside
     # Python's exception handling.
@@ -271,6 +371,7 @@ def main(args):
         os.environ['SDL_AUDIODRIVER']='dummy'
     client=None;original_settings=None;summaries=[]
     try:
+        if args.stream_port:start_stream(args.stream_port)
         stage('connect')
         native=carla.Client('localhost',2000);native.set_timeout(args.rpc_timeout)
         world=native.get_world()
@@ -290,7 +391,7 @@ def main(args):
         # CarlaClient performs an initial tick during construction. Avoid its
         # one-second default physics step destabilizing the freshly spawned car.
         stage('create_client SDL='+os.environ.get('SDL_VIDEODRIVER','default'))
-        client=base.CarlaClient(fixed_delta_seconds=base.CONTROL_DT)
+        client=base.CarlaClient(fixed_delta_seconds=base.CONTROL_DT,filter='vehicle.bh.crossbike') #client=base.CarlaClient(fixed_delta_seconds=base.CONTROL_DT)
         settings=client.sim_world.get_settings();settings.fixed_delta_seconds=base.CONTROL_DT
         client.sim_world.apply_settings(settings)
         stage('create_camera')
@@ -354,7 +455,19 @@ if __name__=='__main__':
     p.add_argument('--stuck-seconds',type=float,default=10.,help='Stationary window after first prediction, in simulation seconds')
     p.add_argument('--stuck-distance',type=float,default=.3,help='Maximum position extent in meters to classify as stuck')
     p.add_argument('--path-selection',choices=['current','official'],default='current')
+    p.add_argument('--stream-port',type=int,default=0,help='Serve a live MJPEG view on localhost:PORT (e.g. 8080); 0 disables')
+    p.add_argument('--depth-camera',action='store_true',help='Attach a ground-truth depth camera co-located with the RGB camera and log an occupancy grid (control is unchanged)')
+    p.add_argument('--save-depth',action='store_true',help='Also save per-frame depth/occupancy .npz files (implies --depth-camera)')
+    p.add_argument('--grid-resolution',type=float,default=0.1,help='Occupancy grid cell size (m)')
+    p.add_argument('--grid-h-min',type=float,default=0.2,help='Keep points higher than this above the road (m)')
+    p.add_argument('--grid-h-max',type=float,default=2.5,help='Keep points lower than this above the road (m)')
+    p.add_argument('--grid-max-range',type=float,default=25.,help='Ignore depth beyond this (m)')
+    p.add_argument('--check-horizon',type=float,default=0.,help='Extend each candidate straight to this length (m) for collision checking only; 0 = use NoMaD paths as-is')
+    p.add_argument('--safety-margin',type=float,default=0.3,help='Added to ego half-width when inflating obstacles (m)')
     args=p.parse_args()
+    if args.save_depth:args.depth_camera=True
+    if not (0<args.grid_resolution and 0<=args.grid_h_min<args.grid_h_max and 0<args.grid_max_range and args.safety_margin>=0):
+        p.error('Invalid grid parameters')
     if not 0<args.obstacle_before_goal<args.goal_distance:p.error('Obstacle must lie between start and goal')
     if not math.isfinite(args.goal_radius) or args.goal_radius<=0:p.error('--goal-radius must be finite and positive')
     if args.goal_radius>=args.obstacle_before_goal:p.error('--goal-radius must be smaller than --obstacle-before-goal')
