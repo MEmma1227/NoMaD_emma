@@ -1,4 +1,4 @@
-CARLA重裝
+## CARLA重裝
 ```
 ssh XXX@ServerName.uwaterloo.ca
 Password
@@ -11,13 +11,13 @@ tar -xf CARLA_0.9.15.tar.gz -C carla && rm CARLA_0.9.15.tar.gz
 ls carla/CarlaUE4.sh
 ```
 
-First, running CARLA simulator
+## First, running CARLA simulator
 ```bash
 cd /tmp/carla_ws/carla
 ./CarlaUE4.sh -RenderOffScreen -quality-level=Low -nosound 
 ```
 
-Open another terminal
+## Second, open another terminal
 ```
 ssh -L 8080:localhost:8080 XXX@ServerName.uwaterloo.ca
 Password
@@ -119,7 +119,13 @@ Where,
 --stream-port 8080
 # Serve a live MJPEG view (RGB | depth | BEV) on localhost:8080; 0 disables.
 ```
-#  虛擬環境
+
+## Third, 開啟localhost即時看
+```
+http://localhost:8080/
+```
+
+##  虛擬環境
 1. 安裝 Miniconda（已經裝過可以跳過）
 ```
 cd ~
